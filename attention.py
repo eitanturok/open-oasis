@@ -43,15 +43,9 @@ class TemporalAxialAttention:
 
         q, k, v = self.to_qkv(x).chunk(3, dim=-1)
 
-        def rearrange_q_k_v(in_tensor:Tensor, heads) -> Tensor:
-            d = in_tensor.shape[-1] // heads
-            in_reshaped = in_tensor.reshape(B, T, H, W, heads, d)
-            in_permuted = in_reshaped.permute(0, 2, 3, 4, 1, 5)
-            return in_permuted.reshape(B*H*W, heads, T, d)
-
-        q = rearrange_q_k_v(q, self.heads)
-        k = rearrange_q_k_v(k, self.heads)
-        v = rearrange_q_k_v(v, self.heads)
+        q = rearrange(q, "B T H W (h d) -> (B H W) h T d", h=self.heads)
+        k = rearrange(k, "B T H W (h d) -> (B H W) h T d", h=self.heads)
+        v = rearrange(v, "B T H W (h d) -> (B H W) h T d", h=self.heads)
 
         if self.rotary_emb is not None:
             q = self.rotary_emb.rotate_queries_or_keys(q, self.rotary_emb.freqs)
@@ -63,7 +57,7 @@ class TemporalAxialAttention:
             key=k, value=v, is_causal=self.is_causal
         )
 
-        x = x.reshape(B, H, W, h, T, d).permute(0, 4, 1, 2, 3, 5).reshape(B, T, H, W, h*d)
+        x = rearrange(x, "(B H W) h T d -> B T H W (h d)", B=B, H=H, W=W)
         x = x.cast(dtype=q.dtype)
 
         # linear proj
@@ -120,16 +114,9 @@ class SpatialAxialAttention:
 
         q, k, v = self.to_qkv(x).chunk(3, dim=-1)
 
-        def rearrange_q_k_v(in_tensor, heads):
-            d = D // heads
-            in_reshaped = in_tensor.reshape(B, T, H, W, heads, d)
-            in_permuted = in_reshaped.permute(0, 1, 4, 2, 3, 5)
-            return in_permuted.reshape(B*T, self.heads, H, W, d)
-
-
-        q = rearrange_q_k_v(q, self.heads)
-        k = rearrange_q_k_v(k, self.heads)
-        v = rearrange_q_k_v(v, self.heads)
+        q = rearrange(q, "B T H W (h d) -> (B T) h H W d", h=self.heads)
+        k = rearrange(k, "B T H W (h d) -> (B T) h H W d", h=self.heads)
+        v = rearrange(v, "B T H W (h d) -> (B T) h H W d", h=self.heads)
 
         if self.rotary_emb is not None:
             freqs = self.rotary_emb.get_axial_freqs(H, W)
@@ -137,13 +124,9 @@ class SpatialAxialAttention:
             k = apply_rotary_emb(freqs, k)
 
         # prepare for attn
-        d = D // self.heads
-        q = q.reshape(B*T, self.heads, H*W, d)
-        k = k.reshape(B*T, self.heads, H*W, d)
-        v = v.reshape(B*T, self.heads, H*W, d)
-        #q = rearrange(q, "(B T) h H W d -> (B T) h (H W) d", B=B, T=T, h=self.heads)
-        #k = rearrange(k, "(B T) h H W d -> (B T) h (H W) d", B=B, T=T, h=self.heads)
-        #v = rearrange(v, "(B T) h H W d -> (B T) h (H W) d", B=B, T=T, h=self.heads)
+        q = rearrange(q, "(B T) h H W d -> (B T) h (H W) d", B=B, T=T, h=self.heads)
+        k = rearrange(k, "(B T) h H W d -> (B T) h (H W) d", B=B, T=T, h=self.heads)
+        v = rearrange(v, "(B T) h H W d -> (B T) h (H W) d", B=B, T=T, h=self.heads)
 
         q, k, v = map(lambda t: t.contiguous(), (q, k, v))
 
@@ -151,8 +134,7 @@ class SpatialAxialAttention:
             key=k, value=v, is_causal=False
         )
 
-        x = x.view(B, T, h, H, W, d).permute(0, 1, 3, 4, 2, 5).view(B, T, H, W, D)
-        #x = rearrange(x, "(B T) h (H W) d -> B T H W (h d)", B=B, H=H, W=W)
+        x = rearrange(x, "(B T) h (H W) d -> B T H W (h d)", B=B, H=H, W=W)
         x = x.cast(dtype=q.dtype)
 
         # linear proj

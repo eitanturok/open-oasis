@@ -9,11 +9,11 @@ import tinygrad
 from tinygrad import nn, Tensor, dtypes
 import numpy as np
 
-from einops import rearrange, repeat
+from einops import rearrange, repeat, einsum
 
 from typing import Literal
 
-from utils import broadcast_tensors
+from utils import broadcast_tensors, linspace
 
 # helper functions
 
@@ -25,6 +25,22 @@ def default(val, d):
 
 # broadcat, as tortoise-tts was using it
 
+def unbind(tensor: Tensor, dim: int = 0) -> List[Tensor]:
+    if dim < 0:
+        dim += tensor.ndim
+
+    if dim < 0 or dim >= tensor.ndim:
+        raise ValueError(f"Dimension out of range (expected to be in range of [{-tensor.ndim}, {tensor.ndim-1}], but got {dim})")
+
+    slices = []
+    for i in range(tensor.shape[dim]):
+        # Create a slice for each index along the specified dimension
+        slice_indices = [slice(None)] * tensor.ndim
+        slice_indices[dim] = i
+        slices.append(tensor[tuple(slice_indices)])
+
+    return slices
+
 def broadcat(tensors, dim = -1):
     broadcasted_tensors = broadcast_tensors(*tensors)
     return Tensor.cat(broadcasted_tensors, dim = dim)
@@ -33,8 +49,8 @@ def broadcat(tensors, dim = -1):
 
 def rotate_half(x):
     x = rearrange(x, '... (d r) -> ... d r', r = 2)
-    x1, x2 = x.unbind(dim = -1)
-    x = Tensor.stack((-x2, x1), dim = -1)
+    x1, x2 = unbind(x, dim = -1)
+    x = Tensor.stack(-x2, x1, dim = -1)
     return rearrange(x, '... d r -> ... (d r)')
 
 def apply_rotary_emb(freqs, t, start_index = 0, scale = 1., seq_dim = -2):
@@ -105,10 +121,10 @@ class RotaryEmbedding:
         elif freqs_for == 'lang':
             freqs = 1. / (theta ** (Tensor.arange(0, dim, 2)[:(dim // 2)].float() / dim))
         elif freqs_for == 'pixel':
-            freqs = Tensor(np.linspace(1., max_freq / 2, dim // 2, dtype='f')) * pi
+            freqs = Tensor(np.linspace(1., max_freq / 2, dim // 2, dtype='f')).float() * pi
         elif freqs_for == 'spacetime':
             time_freqs = 1. / (theta ** (Tensor.arange(0, dim, 2)[:(dim // 2)].float() / dim))
-            freqs = Tensor(np.linspace(1., max_freq / 2, dim // 2, dtype='f')) * pi
+            freqs = Tensor(np.linspace(1., max_freq / 2, dim // 2, dtype='f')).float() * pi
         elif freqs_for == 'constant':
             freqs = Tensor.ones(num_freqs).float()
 
@@ -119,7 +135,7 @@ class RotaryEmbedding:
         self.cache_if_possible = cache_if_possible
         self.cache_max_seq_len = cache_max_seq_len
 
-        self.cached_freqs = Tensor.zeros(cache_max_seq_len, dim, requires_grad = False)
+        self.cached_freqs = Tensor.zeros(cache_max_seq_len, dim, requires_grad = False).contiguous()
         self.cached_freqs_seq_len = Tensor(0, requires_grad = False)
 
         self.learned_freq = learned_freq
@@ -219,8 +235,8 @@ class RotaryEmbedding:
         rotated_q = apply_rotary_emb(seq_freqs, q, scale = scale, seq_dim = seq_dim)
         rotated_k = apply_rotary_emb(seq_freqs, k, scale = scale ** -1, seq_dim = seq_dim)
 
-        rotated_q = rotated_q.type(q.dtype)
-        rotated_k = rotated_k.type(k.dtype)
+        rotated_q = rotated_q.cast(q.dtype)
+        rotated_k = rotated_k.cast(k.dtype)
 
         return rotated_q, rotated_k
 
@@ -262,10 +278,11 @@ class RotaryEmbedding:
         all_freqs = []
 
         for ind, dim in enumerate(dims):
+            #print(f'get_axial_freqs ind: {ind}, dim: {dim}')
             # only allow pixel freqs for last two dimensions
             use_pixel = (self.freqs_for == 'pixel' or self.freqs_for == 'spacetime') and ind >= len(dims) - 2
             if use_pixel:
-                pos = Tensor(np.linspace(-1, 1, dim, dtype='f'))
+                pos = linspace(-1, 1, dim).float()
             else:
                 pos = Tensor.arange(dim)
 
@@ -278,8 +295,12 @@ class RotaryEmbedding:
             all_axis[ind] = Colon
 
             new_axis_slice = (Ellipsis, *all_axis, Colon)
+            #print(f'new_axis_slice: {new_axis_slice}')
+            #print(f'seq_freqs: {seq_freqs}')
+            #print(f'seq_freqs[new_axis_slice]: {seq_freqs[new_axis_slice]}')
             all_freqs.append(seq_freqs[new_axis_slice])
 
+        #print(f'all_freqs: {all_freqs}')
         all_freqs = broadcast_tensors(*all_freqs)
         return Tensor.cat(*all_freqs, dim = -1)
 
@@ -305,12 +326,21 @@ class RotaryEmbedding:
         ):
             return self.cached_freqs[offset:(offset + seq_len)].detach()
 
-        print(f'freqs: {freqs.numpy()}, t casted: {t.cast(freqs.dtype).numpy()}')
-        freqs = t.cast(freqs.dtype).reshape(*t.shape, 1) * freqs
+        #print(f'freqs: {freqs.numpy()}, t casted: {t.cast(freqs.dtype).numpy()}')
+        #print(f't shape: {t.shape}, freqs.shape: {freqs.shape}')
+        t_casted = t.cast(freqs.dtype)
+        # Perform einsum
+        try:
+            result = Tensor.einsum('..., f -> ... f', t_casted, freqs)
+        except Exception as e:
+            print("Einsum failed:", str(e))
+            # If einsum fails, try a manual implementation
+            t_expanded = t_casted.reshape(*t_casted.shape, 1)
+            freqs = t_expanded * freqs
         freqs = repeat(freqs, '... n -> ... (n r)', r = 2)
 
         if should_cache and offset == 0:
             self.cached_freqs[:seq_len] = freqs.detach()
-            self.cached_freqs_seq_len.copy_(seq_len)
+            self.cached_freqs_seq_len.assign(seq_len)
 
         return freqs

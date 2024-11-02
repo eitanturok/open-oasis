@@ -12,51 +12,8 @@ from tinygrad import Tensor, nn, dtypes
 from einops import rearrange
 from rotary_embedding_torch import RotaryEmbedding, apply_rotary_emb
 from dit import PatchEmbed
-
-"""
-Silly, but gotta be done: Mlp has a different implementation in
-timm, and so...gotta match weights :shrug:
-"""
-
-class Mlp:
-    """ MLP as used in Vision Transformer, MLP-Mixer and related networks
-    """
-    def __init__(
-            self,
-            in_features,
-            hidden_features=None,
-            out_features=None,
-            act_layer=Tensor.gelu,
-            norm_layer=None,
-            bias=True,
-            drop=0.,
-            use_conv=False,
-    ):
-        super().__init__()
-        out_features = out_features or in_features
-        hidden_features = hidden_features or in_features
-        drop_probs = (drop, drop)
-        linear_layer = partial(nn.Conv2d, kernel_size=1) if use_conv else nn.Linear
-
-        self.fc1 = linear_layer(in_features, hidden_features, bias=bias)
-        self.act = act_layer
-        self.drop1 = drop_probs[0]
-        self.norm = norm_layer(hidden_features)
-        self.fc2 = linear_layer(hidden_features, out_features, bias=bias)
-        self.drop2 = drop_probs[1]
-
-    def __call__(self, x:Tensor) -> Tensor:
-        x = self.fc1(x)
-        x = self.act(x)
-        if Tensor.training:
-            x = x.dropout(self.drop1)
-        if self.norm is not None:
-            x = self.norm(x)
-        x = self.fc2(x)
-        if Tensor.training:
-            x = x.dropout(self.drop2)
-        return x
-
+from timm_helpers import Mlp
+from utils import xavier_uniform_, Module
 
 class DiagonalGaussianDistribution(object):
     def __init__(self, parameters, deterministic=False, dim=1):
@@ -148,6 +105,19 @@ class Attention:
             x = x.dropout(self.proj_drop)
         return x
 
+class DropPath:
+    def __init__(self, drop_prob: float = 0.0):
+        self.drop_prob = drop_prob
+        
+    def __call__(self, x: Tensor) -> Tensor:
+        if self.drop_prob == 0. or not Tensor.training:
+            return x
+        
+        keep_prob = 1 - self.drop_prob
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)  # work with diff dim tensors, not just 2D ConvNets
+        random_tensor = Tensor.rand(*shape) < keep_prob
+        random_tensor = random_tensor.cast(x.dtype) / keep_prob
+        return x * random_tensor
 
 class AttentionBlock:
     def __init__(
@@ -178,7 +148,7 @@ class AttentionBlock:
             is_causal=attn_causal,
         )
         # NOTE: drop path for stochastic depth, we shall see if this is better than dropout here
-        self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+        self.drop_path = DropPath(drop_path) if drop_path > 0.0 else None
         self.norm2 = norm_layer(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = Mlp(
@@ -188,13 +158,17 @@ class AttentionBlock:
             drop=drop,
         )
 
-    def forward(self, x):
-        x = x + self.drop_path(self.attn(self.norm1(x)))
-        x = x + self.drop_path(self.mlp(self.norm2(x)))
+    def __call__(self, x:Tensor) -> Tensor:
+        if self.drop_path is not None:
+            x = x + self.drop_path(self.attn(self.norm1(x)))
+            x = x + self.drop_path(self.mlp(self.norm2(x)))
+        else:
+            x = x + self.attn(self.norm1(x))
+            x = x + self.mlp(self.norm2(x))
         return x
 
 
-class AutoencoderKL:
+class AutoencoderKL(Module):
     def __init__(
         self,
         latent_dim,
@@ -267,21 +241,6 @@ class AutoencoderKL:
 
         # initialize this weight first
         self.initialize_weights()
-
-    def xavier_uniform_(tensor, gain=1.0):
-        fan_in, fan_out = tensor.shape[0], tensor.shape[-1]
-    
-        # Calculate the range for the uniform distribution
-        std = gain * math.sqrt(2.0 / (fan_in + fan_out))
-        a = math.sqrt(3.0) * std  # Calculate boundary of uniform distribution
-    
-        # Create a new tensor with values drawn from a uniform distribution
-        xavier_tensor = (Tensor.uniform(tensor.shape) * 2 - 1) * a
-    
-        # In-place update of the input tensor
-        tensor.assign(xavier_tensor)
-    
-        return tensor
 
     def initialize_weights(self):
         # initialization

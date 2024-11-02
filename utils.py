@@ -5,7 +5,35 @@ Action format derived from VPT https://github.com/openai/Video-Pre-Training
 import math
 from tinygrad import nn, Tensor, dtypes
 from einops import rearrange, parse_shape
-from typing import Mapping, Sequence
+from typing import Mapping, Sequence, List, Tuple
+import numpy as np
+
+"""
+We really need a .apply function.
+This lets you apply inits recursively.
+"""
+
+class Module:
+    def apply(self, fn):
+        for key, value in self.__dict__.items():
+            if isinstance(value, Module):
+                value.apply(fn)
+            elif isinstance(value, Tensor):
+                fn(value)
+        fn(self)
+        return self
+
+    def __setattr__(self, name, value):
+        if isinstance(value, Tensor):
+            value.requires_grad = True
+        super().__setattr__(name, value)
+
+def linspace(start, stop, steps):
+    if steps < 2:
+        return Tensor([start])
+    
+    step = (stop - start) / (steps - 1)
+    return Tensor.arange(steps) * step + start
 
 def xavier_uniform_(tensor, gain=1.0):
     fan_in, fan_out = tensor.shape[0], tensor.shape[-1]
@@ -74,26 +102,33 @@ def sigmoid_beta_schedule(timesteps, start=-3, end=3, tau=1, clamp_min=1e-5):
     alphas_cumprod = (-((t * (end - start) + start) / tau).sigmoid() + v_end) / (v_end - v_start)
     alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
     betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
-    return beta.clip(0, 0.999)
+    return betas.clip(0, 0.999)
 
-def broadcast_tensors(*tensors):
-    # Find the maximum number of dimensions
-    max_dims = max(len(t.shape) for t in tensors)
+def broadcast_tensors(*tensors: Tensor) -> List[Tensor]:
+    shapes = [t.shape for t in tensors]
+    max_dims = max(len(shape) for shape in shapes)
     
     # Pad shapes with 1s to match the max dimensions
-    padded_shapes = [(1,) * (max_dims - len(t.shape)) + t.shape for t in tensors]
+    padded_shapes = [(1,) * (max_dims - len(shape)) + shape for shape in shapes]
     
     # Find the maximum size for each dimension
-    output_shape = tuple(max(shapes[i] for shapes in padded_shapes) for i in range(max_dims))
+    output_shape = tuple(max(shape[i] for shape in padded_shapes) for i in range(max_dims))
     
     broadcasted_tensors = []
-    for t, padded_shape in zip(tensors, padded_shapes):
-        # Create a new shape that broadcasts to the output shape
-        new_shape = tuple(os if ps == 1 or ps == os else -1 
-                          for ps, os in zip(padded_shape, output_shape))
+    for t in tensors:
+        new_shape = list(output_shape)
+        for i, dim in enumerate(reversed(t.shape)):
+            if dim != 1:
+                new_shape[-(i+1)] = dim
         
         # Reshape and expand the tensor
-        broadcasted = t.reshape(new_shape).expand(output_shape)
+        broadcasted = t.reshape(*(1,) * (len(output_shape) - len(t.shape)) + t.shape)
+        for i, (s, o) in enumerate(zip(broadcasted.shape, output_shape)):
+            if s != o:
+                expand_shape = list(broadcasted.shape)
+                expand_shape[i] = o
+                broadcasted = broadcasted.expand(expand_shape)
+        
         broadcasted_tensors.append(broadcasted)
     
     return broadcasted_tensors
@@ -127,7 +162,8 @@ ACTION_KEYS = [
 ]
 
 def one_hot_actions(actions: Sequence[Mapping[str, int]]) -> Tensor:
-    actions_one_hot = Tensor.zeros(len(actions), len(ACTION_KEYS))
+    actions_one_hot = np.zeros((len(actions), len(ACTION_KEYS)), dtype='f')
+
     for i, current_actions in enumerate(actions):
         for j, action_key in enumerate(ACTION_KEYS):
             if action_key.startswith("camera"):
@@ -148,6 +184,8 @@ def one_hot_actions(actions: Sequence[Mapping[str, int]]) -> Tensor:
             else:
                 value = current_actions[action_key]
                 assert 0 <= value <= 1, f"Action value must be in [0, 1] got {value}"
+            print(f'settings actions_one_hot[{i}, {j}] = {value}')
             actions_one_hot[i, j] = value
-        
+    
+    actions_one_hot = Tensor(actions_one_hot, dtype=dtypes.float).contiguous()
     return actions_one_hot

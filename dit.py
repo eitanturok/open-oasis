@@ -12,14 +12,14 @@ from einops import rearrange
 from embeddings import Timesteps, TimestepEmbedding
 from attention import SpatialAxialAttention, TemporalAxialAttention
 from timm_helpers import Mlp
-from utils import xavier_uniform_, constant_, normal_
+from utils import xavier_uniform_, constant_, normal_, Module
 import math
 
 def modulate(x, shift, scale):
     fixed_dims = [1] * len(shift.shape[1:])
     shift = shift.repeat(x.shape[0] // shift.shape[0], *fixed_dims)
     scale = scale.repeat(x.shape[0] // scale.shape[0], *fixed_dims)
-    while shift.dim() < x.dim():
+    while len(shift.shape) < len(x.shape):
         shift = shift.unsqueeze(-2)
         scale = scale.unsqueeze(-2)
     return x * (1 + scale) + shift
@@ -27,7 +27,7 @@ def modulate(x, shift, scale):
 def gate(x, g):
     fixed_dims = [1] * len(g.shape[1:])
     g = g.repeat(x.shape[0] // g.shape[0], *fixed_dims)
-    while g.dim() < x.dim():
+    while len(g.shape) < len(x.shape):
         g = g.unsqueeze(-2)
     return g * x
 
@@ -65,9 +65,9 @@ class PatchEmbed:
         ), f"Input image size ({H}*{W}) doesn't match model ({self.img_size[0]}*{self.img_size[1]})."
         x = self.proj(x)
         if self.flatten:
-            x = x.permute(0, 2, 3, 1).reshape(B, H * W, C)
+            x = rearrange(x, "B C H W -> B (H W) C")
         else:
-            x = x.permute(0, 2, 3, 1)
+            x = rearrange(x, "B C H W -> B H W C")
         if self.norm is not None:
             x = self.norm(x)
         return x
@@ -108,7 +108,7 @@ class TimestepEmbedder:
 
     def __call__(self, t:Tensor) -> Tensor:
         t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
-        t_emb = self.mlp(t_freq)
+        t_emb = t_freq.sequential(self.mlp)
         return t_emb
 
 class FinalLayer:
@@ -125,7 +125,7 @@ class FinalLayer:
         ]
 
     def __call__(self, x:Tensor, c:Tensor) -> Tensor:
-        shift, scale = c.sequential(adaLN_modulation).chunk(2, dim=-1)
+        shift, scale = c.sequential(self.adaLN_modulation).chunk(2, dim=-1)
         x = modulate(self.norm_final(x), shift, scale)
         x = self.linear(x)
         return x
@@ -159,7 +159,7 @@ class SpatioTemporalDiTBlock:
         B, T, H, W, D = x.shape
 
         # spatial block
-        s_shift_msa, s_scale_msa, s_gate_msa, s_shift_mlp, s_scale_mlp, s_gate_mlp = c.sequential(s_adaLN_modulation).chunk(6, dim=-1)
+        s_shift_msa, s_scale_msa, s_gate_msa, s_shift_mlp, s_scale_mlp, s_gate_mlp = c.sequential(self.s_adaLN_modulation).chunk(6, dim=-1)
         x = x + gate(self.s_attn(modulate(self.s_norm1(x), s_shift_msa, s_scale_msa)), s_gate_msa)
         x = x + gate(self.s_mlp(modulate(self.s_norm2(x), s_shift_mlp, s_scale_mlp)), s_gate_mlp)
 
@@ -170,7 +170,7 @@ class SpatioTemporalDiTBlock:
 
         return x
 
-class DiT:
+class DiT(Module):
     """
     Diffusion model with a Transformer backbone.
     """
@@ -224,7 +224,7 @@ class DiT:
                 xavier_uniform_(module.weight)
                 if module.bias is not None:
                     constant_(module.bias, 0)
-        #self.apply(_basic_init)
+        self.apply(_basic_init)
         _basic_init(self.external_cond)
 
         # Initialize patch_embed like nn.Linear (instead of nn.Conv2d):
@@ -260,7 +260,7 @@ class DiT:
         w = x.shape[2]
 
         x = x.reshape(shape=(x.shape[0], h, w, p, p, c))
-        x = x.premute(0, 5, 1, 3, 2, 4)
+        x = x.permute(0, 5, 1, 3, 2, 4)
         imgs = x.reshape(shape=(x.shape[0], c, h * p, w * p))
         return imgs
 
@@ -282,7 +282,7 @@ class DiT:
         t = t.reshape(t.shape[0] * t.shape[1])
         c = self.t_embedder(t)                  # (N, D)
         c = rearrange(c, "(b t) d -> b t d", t = T)
-        if torch.is_tensor(external_cond):
+        if type(external_cond) is tinygrad.Tensor:
             c += self.external_cond(external_cond)
         for block in self.blocks:
             x = block(x, c)                      # (N, T, H, W, D)
