@@ -3,14 +3,12 @@ Based on https://github.com/buoyancy99/diffusion-forcing/blob/main/algorithms/di
 """
 from typing import Optional
 from collections import namedtuple
-import torch
-from torch import nn
-from torch.nn import functional as F
+from tinygrad import Tensor, nn
 from einops import rearrange
 from rotary_embedding_torch import RotaryEmbedding, apply_rotary_emb
 from embeddings import TimestepEmbedding, Timesteps, Positions2d
 
-class TemporalAxialAttention(nn.Module):
+class TemporalAxialAttention:
     def __init__(
         self,
         dim: int,
@@ -28,30 +26,32 @@ class TemporalAxialAttention(nn.Module):
         self.to_out = nn.Linear(self.inner_dim, dim)
 
         self.rotary_emb = rotary_emb
-        self.time_pos_embedding = (
-            nn.Sequential(
+        self.time_pos_embedding = [
                 Timesteps(dim),
                 TimestepEmbedding(in_channels=dim, time_embed_dim=dim * 4, out_dim=dim),
-            )
-            if rotary_emb is None
-            else None
-        )
+            ] if rotary_emb is None else None
         self.is_causal = is_causal
 
-    def forward(self, x: torch.Tensor):
+    def __call__(self, x: Tensor) -> Tensor:
         B, T, H, W, D = x.shape
 
         if self.time_pos_embedding is not None:
             time_emb = self.time_pos_embedding(
-                torch.arange(T, device=x.device)
+                Tensor.arange(T)
             )
-            x = x + rearrange(time_emb, "t d -> 1 t 1 1 d")
+            x = x + time_emb.unsqueeze(0).unsqueeze(2).unsqueeze(2)
 
         q, k, v = self.to_qkv(x).chunk(3, dim=-1)
 
-        q = rearrange(q, "B T H W (h d) -> (B H W) h T d", h=self.heads)
-        k = rearrange(k, "B T H W (h d) -> (B H W) h T d", h=self.heads)
-        v = rearrange(v, "B T H W (h d) -> (B H W) h T d", h=self.heads)
+        def rearrange_q_k_v(in_tensor:Tensor, heads) -> Tensor:
+            d = in_tensor.shape[-1] // heads
+            in_reshaped = in_tensor.reshape(B, T, H, W, heads, d)
+            in_permuted = in_reshaped.permute(0, 2, 3, 4, 1, 5)
+            return in_permuted.reshape(B*H*W, heads, T, d)
+
+        q = rearrange_q_k_v(q, self.heads)
+        k = rearrange_q_k_v(k, self.heads)
+        v = rearrange_q_k_v(v, self.heads)
 
         if self.rotary_emb is not None:
             q = self.rotary_emb.rotate_queries_or_keys(q, self.rotary_emb.freqs)
@@ -59,18 +59,18 @@ class TemporalAxialAttention(nn.Module):
 
         q, k, v = map(lambda t: t.contiguous(), (q, k, v))
 
-        x = F.scaled_dot_product_attention(
-            query=q, key=k, value=v, is_causal=self.is_causal
+        x = q.scaled_dot_product_attention(
+            key=k, value=v, is_causal=self.is_causal
         )
 
-        x = rearrange(x, "(B H W) h T d -> B T H W (h d)", B=B, H=H, W=W)
-        x = x.to(q.dtype)
+        x = x.reshape(B, H, W, h, T, d).permute(0, 4, 1, 2, 3, 5).reshape(B, T, H, W, h*d)
+        x = x.cast(dtype=q.dtype)
 
         # linear proj
         x = self.to_out(x)
         return x
 
-class SpatialAxialAttention(nn.Module):
+class SpatialAxialAttention:
     def __init__(
         self,
         dim: int,
@@ -87,30 +87,49 @@ class SpatialAxialAttention(nn.Module):
         self.to_out = nn.Linear(self.inner_dim, dim)
 
         self.rotary_emb = rotary_emb
-        self.space_pos_embedding = (
-            nn.Sequential(
+        self.space_pos_embedding = [
                 Positions2d(dim),
                 TimestepEmbedding(in_channels=dim, time_embed_dim=dim * 4, out_dim=dim),
-            )
-            if rotary_emb is None
-            else None
-        )
+            ] if rotary_emb is None else None
 
-    def forward(self, x: torch.Tensor):
+    def tinygrad_meshgrid(*tensors, indexing='ij'):
+        grids = []
+        for i, tensor in enumerate(tensors):
+            shape = [1] * len(tensors)
+            shape[i] = -1
+            grid = tensor.reshape(*shape)
+            repeat_shape = list(len(t) for t in tensors)
+            repeat_shape[i] = 1
+            grid = grid.repeat(repeat_shape)
+            grids.append(grid)
+    
+        if indexing == 'xy':
+            grids[0], grids[1] = grids[1], grids[0]
+    
+        return tuple(grids)
+
+    def __call__(self, x: Tensor) -> Tensor:
         B, T, H, W, D = x.shape
 
         if self.space_pos_embedding is not None:
-            h_steps = torch.arange(H, device=x.device)
-            w_steps = torch.arange(W, device=x.device)
-            grid = torch.meshgrid(h_steps, w_steps, indexing="ij")
+            h_steps = Tensor.arange(H, device=x.device)
+            w_steps = Tensor.arange(W, device=x.device)
+            grid = tinygrad_meshgrid(h_steps, w_steps, indexing="ij")
             space_emb = self.space_pos_embedding(grid)
-            x = x + rearrange(space_emb, "h w d -> 1 1 h w d")
+            x = x + space_emb.unsqueeze(0).unsqueeze(0)
 
         q, k, v = self.to_qkv(x).chunk(3, dim=-1)
 
-        q = rearrange(q, "B T H W (h d) -> (B T) h H W d", h=self.heads)
-        k = rearrange(k, "B T H W (h d) -> (B T) h H W d", h=self.heads)
-        v = rearrange(v, "B T H W (h d) -> (B T) h H W d", h=self.heads)
+        def rearrange_q_k_v(in_tensor, heads):
+            d = D // heads
+            in_reshaped = in_tensor.reshape(B, T, H, W, heads, d)
+            in_permuted = in_reshaped.permute(0, 1, 4, 2, 3, 5)
+            return in_permuted.reshape(B*T, self.heads, H, W, d)
+
+
+        q = rearrange_q_k_v(q, self.heads)
+        k = rearrange_q_k_v(k, self.heads)
+        v = rearrange_q_k_v(v, self.heads)
 
         if self.rotary_emb is not None:
             freqs = self.rotary_emb.get_axial_freqs(H, W)
@@ -118,18 +137,23 @@ class SpatialAxialAttention(nn.Module):
             k = apply_rotary_emb(freqs, k)
 
         # prepare for attn
-        q = rearrange(q, "(B T) h H W d -> (B T) h (H W) d", B=B, T=T, h=self.heads)
-        k = rearrange(k, "(B T) h H W d -> (B T) h (H W) d", B=B, T=T, h=self.heads)
-        v = rearrange(v, "(B T) h H W d -> (B T) h (H W) d", B=B, T=T, h=self.heads)
+        d = D // self.heads
+        q = q.reshape(B*T, self.heads, H*W, d)
+        k = k.reshape(B*T, self.heads, H*W, d)
+        v = v.reshape(B*T, self.heads, H*W, d)
+        #q = rearrange(q, "(B T) h H W d -> (B T) h (H W) d", B=B, T=T, h=self.heads)
+        #k = rearrange(k, "(B T) h H W d -> (B T) h (H W) d", B=B, T=T, h=self.heads)
+        #v = rearrange(v, "(B T) h H W d -> (B T) h (H W) d", B=B, T=T, h=self.heads)
 
         q, k, v = map(lambda t: t.contiguous(), (q, k, v))
 
-        x = F.scaled_dot_product_attention(
-            query=q, key=k, value=v, is_causal=False
+        x = q.scaled_dot_product_attention(
+            key=k, value=v, is_causal=False
         )
 
-        x = rearrange(x, "(B T) h (H W) d -> B T H W (h d)", B=B, H=H, W=W)
-        x = x.to(q.dtype)
+        x = x.view(B, T, h, H, W, d).permute(0, 1, 3, 4, 2, 5).view(B, T, H, W, D)
+        #x = rearrange(x, "(B T) h (H W) d -> B T H W (h d)", B=B, H=H, W=W)
+        x = x.cast(dtype=q.dtype)
 
         # linear proj
         x = self.to_out(x)

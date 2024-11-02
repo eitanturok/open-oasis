@@ -7,44 +7,81 @@ import numpy as np
 import math
 import functools
 from collections import namedtuple
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+import tinygrad
+from tinygrad import Tensor, nn, dtypes
 from einops import rearrange
-from timm.models.vision_transformer import Mlp
-from timm.layers.helpers import to_2tuple
 from rotary_embedding_torch import RotaryEmbedding, apply_rotary_emb
 from dit import PatchEmbed
+
+"""
+Silly, but gotta be done: Mlp has a different implementation in
+timm, and so...gotta match weights :shrug:
+"""
+
+class Mlp:
+    """ MLP as used in Vision Transformer, MLP-Mixer and related networks
+    """
+    def __init__(
+            self,
+            in_features,
+            hidden_features=None,
+            out_features=None,
+            act_layer=Tensor.gelu,
+            norm_layer=None,
+            bias=True,
+            drop=0.,
+            use_conv=False,
+    ):
+        super().__init__()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+        drop_probs = (drop, drop)
+        linear_layer = partial(nn.Conv2d, kernel_size=1) if use_conv else nn.Linear
+
+        self.fc1 = linear_layer(in_features, hidden_features, bias=bias)
+        self.act = act_layer
+        self.drop1 = drop_probs[0]
+        self.norm = norm_layer(hidden_features)
+        self.fc2 = linear_layer(hidden_features, out_features, bias=bias)
+        self.drop2 = drop_probs[1]
+
+    def __call__(self, x:Tensor) -> Tensor:
+        x = self.fc1(x)
+        x = self.act(x)
+        if Tensor.training:
+            x = x.dropout(self.drop1)
+        if self.norm is not None:
+            x = self.norm(x)
+        x = self.fc2(x)
+        if Tensor.training:
+            x = x.dropout(self.drop2)
+        return x
+
 
 class DiagonalGaussianDistribution(object):
     def __init__(self, parameters, deterministic=False, dim=1):
         self.parameters = parameters
-        self.mean, self.logvar = torch.chunk(parameters, 2, dim=dim)
+        self.mean, self.logvar = parameters.chunk(2, dim=dim)
         if dim == 1:
             self.dims = [1, 2, 3]
         elif dim == 2:
             self.dims = [1, 2]
         else:
             raise NotImplementedError
-        self.logvar = torch.clamp(self.logvar, -30.0, 20.0)
+        self.logvar = self.logvar.clamp(min_=-30.0, max_=20.0)
         self.deterministic = deterministic
-        self.std = torch.exp(0.5 * self.logvar)
-        self.var = torch.exp(self.logvar)
+        self.std = (0.5 * self.logvar).exp()
+        self.var = self.logvar.exp()
         if self.deterministic:
-            self.var = self.std = torch.zeros_like(self.mean).to(
-                device=self.parameters.device
-            )
+            self.var = self.std = Tensor.zeros_like(self.mean)
 
     def sample(self):
-        x = self.mean + self.std * torch.randn(self.mean.shape).to(
-            device=self.parameters.device
-        )
-        return x
+        return self.mean + self.std * Tensor.randn(self.mean.shape)
 
     def mode(self):
         return self.mean
 
-class Attention(nn.Module):
+class Attention:
     def __init__(
         self,
         dim,
@@ -65,7 +102,7 @@ class Attention(nn.Module):
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         self.attn_drop = attn_drop
         self.proj = nn.Linear(dim, dim)
-        self.proj_drop = nn.Dropout(proj_drop)
+        self.proj_drop = proj_drop
         self.is_causal = is_causal
 
         rotary_freqs = RotaryEmbedding(
@@ -73,9 +110,9 @@ class Attention(nn.Module):
             freqs_for="pixel", 
             max_freq=frame_height*frame_width,
         ).get_axial_freqs(frame_height, frame_width)
-        self.register_buffer("rotary_freqs", rotary_freqs, persistent=False)
+        self.rotary_freqs = Tensor(rotary_freqs.numpy(), requires_grad=False)
 
-    def forward(self, x):
+    def __call__(self, x:Tensor) -> Tensor:
         B, N, C = x.shape
         assert N == self.frame_height * self.frame_width
 
@@ -98,8 +135,7 @@ class Attention(nn.Module):
             q = rearrange(q, "b h H W d -> b h (H W) d")
             k = rearrange(k, "b h H W d -> b h (H W) d")
 
-        attn = F.scaled_dot_product_attention(
-            q,
+        attn = q.scaled_dot_product_attention(
             k,
             v,
             dropout_p=self.attn_drop,
@@ -108,11 +144,12 @@ class Attention(nn.Module):
         x = attn.transpose(1, 2).reshape(B, N, C)
 
         x = self.proj(x)
-        x = self.proj_drop(x)
+        if Tensor.training:
+            x = x.dropout(self.proj_drop)
         return x
 
 
-class AttentionBlock(nn.Module):
+class AttentionBlock:
     def __init__(
         self,
         dim,
@@ -125,7 +162,7 @@ class AttentionBlock(nn.Module):
         attn_drop=0.0,
         attn_causal=False,
         drop_path=0.0,
-        act_layer=nn.GELU,
+        act_layer=Tensor.gelu,
         norm_layer=nn.LayerNorm,
     ):
         super().__init__()
@@ -157,7 +194,7 @@ class AttentionBlock(nn.Module):
         return x
 
 
-class AutoencoderKL(nn.Module):
+class AutoencoderKL:
     def __init__(
         self,
         latent_dim,
@@ -192,20 +229,18 @@ class AutoencoderKL(nn.Module):
         self.patch_embed = PatchEmbed(input_height, input_width, patch_size, 3, enc_dim)
 
         # encoder
-        self.encoder = nn.ModuleList(
-            [
-                AttentionBlock(
-                    enc_dim,
-                    enc_heads,
-                    self.seq_h,
-                    self.seq_w,
-                    mlp_ratio,
-                    qkv_bias=True,
-                    norm_layer=norm_layer,
-                )
-                for i in range(enc_depth)
-            ]
-        )
+        self.encoder = [
+            AttentionBlock(
+                enc_dim,
+                enc_heads,
+                self.seq_h,
+                self.seq_w,
+                mlp_ratio,
+                qkv_bias=True,
+                norm_layer=norm_layer,
+            )
+            for i in range(enc_depth)
+        ]
         self.enc_norm = norm_layer(enc_dim)
 
         # bottleneck
@@ -215,26 +250,38 @@ class AutoencoderKL(nn.Module):
         self.post_quant_conv = nn.Linear(latent_dim, dec_dim)
 
         # decoder
-        self.decoder = nn.ModuleList(
-            [
-                AttentionBlock(
-                    dec_dim,
-                    dec_heads,
-                    self.seq_h,
-                    self.seq_w,
-                    mlp_ratio,
-                    qkv_bias=True,
-                    norm_layer=norm_layer,
-                )
-                for i in range(dec_depth)
-            ]
-        )
+        self.decoder = [
+            AttentionBlock(
+                dec_dim,
+                dec_heads,
+                self.seq_h,
+                self.seq_w,
+                mlp_ratio,
+                qkv_bias=True,
+                norm_layer=norm_layer,
+            )
+            for i in range(dec_depth)
+        ]
         self.dec_norm = norm_layer(dec_dim)
         self.predictor = nn.Linear(dec_dim, self.patch_dim)  # decoder to patch
 
         # initialize this weight first
         self.initialize_weights()
 
+    def xavier_uniform_(tensor, gain=1.0):
+        fan_in, fan_out = tensor.shape[0], tensor.shape[-1]
+    
+        # Calculate the range for the uniform distribution
+        std = gain * math.sqrt(2.0 / (fan_in + fan_out))
+        a = math.sqrt(3.0) * std  # Calculate boundary of uniform distribution
+    
+        # Create a new tensor with values drawn from a uniform distribution
+        xavier_tensor = (Tensor.uniform(tensor.shape) * 2 - 1) * a
+    
+        # In-place update of the input tensor
+        tensor.assign(xavier_tensor)
+    
+        return tensor
 
     def initialize_weights(self):
         # initialization
@@ -242,18 +289,18 @@ class AutoencoderKL(nn.Module):
         self.apply(self._init_weights)
 
         # initialize patch_embed like nn.Linear (instead of nn.Conv2d)
-        w = self.patch_embed.proj.weight.data
-        nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
+        w = self.patch_embed.proj.weight
+        xavier_uniform_(w.view(w.shape[0], -1))
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
             # we use xavier_uniform following official JAX ViT:
-            nn.init.xavier_uniform_(m.weight)
+            xavier_uniform_(m.weight)
             if isinstance(m, nn.Linear) and m.bias is not None:
-                nn.init.constant_(m.bias, 0.0)
+                m.bias.assign(Tensor.full(m.bias.shape, 0.0, dtype=dtypes.float))
         elif isinstance(m, nn.LayerNorm):
-            nn.init.constant_(m.bias, 0.0)
-            nn.init.constant_(m.weight, 1.0)
+            m.bias.assign(Tensor.full(m.bias.shape, 0.0, dtype=dtypes.float))
+            m.weight.assign(Tensor.full(m.weight.shape, 1.0, dtype=dtypes.float))
 
     def patchify(self, x):
         # patchify
@@ -312,7 +359,7 @@ class AutoencoderKL(nn.Module):
         # bottleneck
         moments = self.quant_conv(x)
         if not self.use_variational:
-            moments = torch.cat((moments, torch.zeros_like(moments)), 2)
+            moments = Tensor.cat(moments, Tensor.zeros_like(moments), dim=2)
         posterior = DiagonalGaussianDistribution(
             moments, deterministic=(not self.use_variational), dim=2
         )
@@ -347,10 +394,10 @@ class AutoencoderKL(nn.Module):
         x = batch[k]
         if len(x.shape) == 3:
             x = x[..., None]
-        x = x.permute(0, 3, 1, 2).to(memory_format=torch.contiguous_format).float()
+        x = x.permute(0, 3, 1, 2).contiguous().float()
         return x
 
-    def forward(self, inputs, labels, split="train"):
+    def __call__(self, inputs, labels):
         rec, post, latent = self.autoencode(inputs)
         return rec, post, latent
 

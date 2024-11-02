@@ -5,14 +5,14 @@ References:
     - Latte: https://github.com/Vchitect/Latte/blob/main/models/latte.py
 """
 from typing import Optional, Literal
-import torch
-from torch import nn
+import tinygrad
+from tinygrad import nn, Tensor, dtypes
 from rotary_embedding_torch import RotaryEmbedding
 from einops import rearrange
 from embeddings import Timesteps, TimestepEmbedding
 from attention import SpatialAxialAttention, TemporalAxialAttention
-from timm.models.vision_transformer import Mlp
-from timm.layers.helpers import to_2tuple
+from timm_helpers import Mlp
+from utils import xavier_uniform_, constant_, normal_
 import math
 
 def modulate(x, shift, scale):
@@ -31,7 +31,7 @@ def gate(x, g):
         g = g.unsqueeze(-2)
     return g * x
 
-class PatchEmbed(nn.Module):
+class PatchEmbed:
     """2D Image to Patch Embedding"""
 
     def __init__(
@@ -46,7 +46,7 @@ class PatchEmbed(nn.Module):
     ):
         super().__init__()
         img_size = (img_height, img_width)
-        patch_size = to_2tuple(patch_size)
+        patch_size = (patch_size, patch_size)
         self.img_size = img_size
         self.patch_size = patch_size
         self.grid_size = (img_size[0] // patch_size[0], img_size[1] // patch_size[1])
@@ -56,32 +56,33 @@ class PatchEmbed(nn.Module):
         self.proj = nn.Conv2d(
             in_chans, embed_dim, kernel_size=patch_size, stride=patch_size
         )
-        self.norm = norm_layer(embed_dim) if norm_layer else nn.Identity()
+        self.norm = norm_layer(embed_dim) if norm_layer else None
 
-    def forward(self, x, random_sample=False):
+    def __call__(self, x, random_sample=False):
         B, C, H, W = x.shape
         assert random_sample or (
             H == self.img_size[0] and W == self.img_size[1]
         ), f"Input image size ({H}*{W}) doesn't match model ({self.img_size[0]}*{self.img_size[1]})."
         x = self.proj(x)
         if self.flatten:
-            x = rearrange(x, "B C H W -> B (H W) C")
+            x = x.permute(0, 2, 3, 1).reshape(B, H * W, C)
         else:
-            x = rearrange(x, "B C H W -> B H W C")
-        x = self.norm(x)
+            x = x.permute(0, 2, 3, 1)
+        if self.norm is not None:
+            x = self.norm(x)
         return x
 
-class TimestepEmbedder(nn.Module):
+class TimestepEmbedder:
     """
     Embeds scalar timesteps into vector representations.
     """
     def __init__(self, hidden_size, frequency_embedding_size=256):
         super().__init__()
-        self.mlp = nn.Sequential(
+        self.mlp = [
             nn.Linear(frequency_embedding_size, hidden_size, bias=True), # hidden_size is diffusion model hidden size
-            nn.SiLU(),
+            Tensor.silu,
             nn.Linear(hidden_size, hidden_size, bias=True),
-        )
+        ]
         self.frequency_embedding_size = frequency_embedding_size
 
     @staticmethod
@@ -96,21 +97,21 @@ class TimestepEmbedder(nn.Module):
         """
         # https://github.com/openai/glide-text2im/blob/main/glide_text2im/nn.py
         half = dim // 2
-        freqs = torch.exp(
-            -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half
-        ).to(device=t.device)
+        freqs = Tensor.exp(
+            -math.log(max_period) * Tensor.arange(start=0, stop=half, dtype=dtypes.float32) / half
+        )
         args = t[:, None].float() * freqs[None]
-        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+        embedding = Tensor.cat(*[args.cos(), args.sin()], dim=-1)
         if dim % 2:
-            embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
+            embedding = Tensor.cat(*[embedding, Tensor.zeros_like(embedding[:, :1])], dim=-1)
         return embedding
 
-    def forward(self, t):
+    def __call__(self, t:Tensor) -> Tensor:
         t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
         t_emb = self.mlp(t_freq)
         return t_emb
 
-class FinalLayer(nn.Module):
+class FinalLayer:
     """
     The final layer of DiT.
     """
@@ -118,58 +119,58 @@ class FinalLayer(nn.Module):
         super().__init__()
         self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.linear = nn.Linear(hidden_size, patch_size * patch_size * out_channels, bias=True)
-        self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(),
+        self.adaLN_modulation = [
+            Tensor.silu,
             nn.Linear(hidden_size, 2 * hidden_size, bias=True)
-        )
+        ]
 
-    def forward(self, x, c):
-        shift, scale = self.adaLN_modulation(c).chunk(2, dim=-1)
+    def __call__(self, x:Tensor, c:Tensor) -> Tensor:
+        shift, scale = c.sequential(adaLN_modulation).chunk(2, dim=-1)
         x = modulate(self.norm_final(x), shift, scale)
         x = self.linear(x)
         return x
     
-class SpatioTemporalDiTBlock(nn.Module):
+class SpatioTemporalDiTBlock:
     def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, is_causal=True, spatial_rotary_emb: Optional[RotaryEmbedding] = None, temporal_rotary_emb: Optional[RotaryEmbedding] = None):
         super().__init__()
         self.is_causal = is_causal
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
-        approx_gelu = lambda: nn.GELU(approximate="tanh")
+        approx_gelu = Tensor.quick_gelu
 
         self.s_norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.s_attn = SpatialAxialAttention(hidden_size, heads=num_heads, dim_head=hidden_size // num_heads, rotary_emb=spatial_rotary_emb)
         self.s_norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.s_mlp = Mlp(in_features=hidden_size, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0)
-        self.s_adaLN_modulation = nn.Sequential(
-            nn.SiLU(),
+        self.s_adaLN_modulation = [
+            Tensor.silu,
             nn.Linear(hidden_size, 6 * hidden_size, bias=True)
-        )
+        ]
 
         self.t_norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.t_attn = TemporalAxialAttention(hidden_size, heads=num_heads, dim_head=hidden_size // num_heads, is_causal=is_causal, rotary_emb=temporal_rotary_emb)
         self.t_norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.t_mlp = Mlp(in_features=hidden_size, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0)
-        self.t_adaLN_modulation = nn.Sequential(
-            nn.SiLU(),
+        self.t_adaLN_modulation = [
+            Tensor.silu,
             nn.Linear(hidden_size, 6 * hidden_size, bias=True)
-        )
+        ]
 
-    def forward(self, x, c):
+    def __call__(self, x, c):
         B, T, H, W, D = x.shape
 
         # spatial block
-        s_shift_msa, s_scale_msa, s_gate_msa, s_shift_mlp, s_scale_mlp, s_gate_mlp = self.s_adaLN_modulation(c).chunk(6, dim=-1)
+        s_shift_msa, s_scale_msa, s_gate_msa, s_shift_mlp, s_scale_mlp, s_gate_mlp = c.sequential(s_adaLN_modulation).chunk(6, dim=-1)
         x = x + gate(self.s_attn(modulate(self.s_norm1(x), s_shift_msa, s_scale_msa)), s_gate_msa)
         x = x + gate(self.s_mlp(modulate(self.s_norm2(x), s_shift_mlp, s_scale_mlp)), s_gate_mlp)
 
         # temporal block
-        t_shift_msa, t_scale_msa, t_gate_msa, t_shift_mlp, t_scale_mlp, t_gate_mlp = self.t_adaLN_modulation(c).chunk(6, dim=-1)
+        t_shift_msa, t_scale_msa, t_gate_msa, t_shift_mlp, t_scale_mlp, t_gate_mlp = c.sequential(self.t_adaLN_modulation).chunk(6, dim=-1)
         x = x + gate(self.t_attn(modulate(self.t_norm1(x), t_shift_msa, t_scale_msa)), t_gate_msa)
         x = x + gate(self.t_mlp(modulate(self.t_norm2(x), t_shift_mlp, t_scale_mlp)), t_gate_mlp)
 
         return x
 
-class DiT(nn.Module):
+class DiT:
     """
     Diffusion model with a Transformer backbone.
     """
@@ -201,8 +202,7 @@ class DiT(nn.Module):
         self.temporal_rotary_emb = RotaryEmbedding(dim=hidden_size // num_heads)
         self.external_cond = nn.Linear(external_cond_dim, hidden_size) if external_cond_dim > 0 else nn.Identity()
 
-        self.blocks = nn.ModuleList(
-            [
+        self.blocks = [
                 SpatioTemporalDiTBlock(
                     hidden_size,
                     num_heads,
@@ -213,7 +213,6 @@ class DiT(nn.Module):
                 )
                 for _ in range(depth)
             ]
-        )
 
         self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)
         self.initialize_weights()
@@ -222,32 +221,33 @@ class DiT(nn.Module):
         # Initialize transformer layers:
         def _basic_init(module):
             if isinstance(module, nn.Linear):
-                torch.nn.init.xavier_uniform_(module.weight)
+                xavier_uniform_(module.weight)
                 if module.bias is not None:
-                    nn.init.constant_(module.bias, 0)
-        self.apply(_basic_init)
+                    constant_(module.bias, 0)
+        #self.apply(_basic_init)
+        _basic_init(self.external_cond)
 
         # Initialize patch_embed like nn.Linear (instead of nn.Conv2d):
-        w = self.x_embedder.proj.weight.data
-        nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
-        nn.init.constant_(self.x_embedder.proj.bias, 0)
+        w = self.x_embedder.proj.weight
+        xavier_uniform_(w.view(w.shape[0], -1))
+        constant_(self.x_embedder.proj.bias, 0)
 
         # Initialize timestep embedding MLP:
-        nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
-        nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
+        normal_(self.t_embedder.mlp[0].weight, std=0.02)
+        normal_(self.t_embedder.mlp[2].weight, std=0.02)
 
         # Zero-out adaLN modulation layers in DiT blocks:
         for block in self.blocks:
-            nn.init.constant_(block.s_adaLN_modulation[-1].weight, 0)
-            nn.init.constant_(block.s_adaLN_modulation[-1].bias, 0)
-            nn.init.constant_(block.t_adaLN_modulation[-1].weight, 0)
-            nn.init.constant_(block.t_adaLN_modulation[-1].bias, 0)
+            constant_(block.s_adaLN_modulation[-1].weight, 0)
+            constant_(block.s_adaLN_modulation[-1].bias, 0)
+            constant_(block.t_adaLN_modulation[-1].weight, 0)
+            constant_(block.t_adaLN_modulation[-1].bias, 0)
 
         # Zero-out output layers:
-        nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
-        nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
-        nn.init.constant_(self.final_layer.linear.weight, 0)
-        nn.init.constant_(self.final_layer.linear.bias, 0)
+        constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
+        constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
+        constant_(self.final_layer.linear.weight, 0)
+        constant_(self.final_layer.linear.bias, 0)
 
     def unpatchify(self, x):
         """
@@ -260,11 +260,11 @@ class DiT(nn.Module):
         w = x.shape[2]
 
         x = x.reshape(shape=(x.shape[0], h, w, p, p, c))
-        x = torch.einsum('nhwpqc->nchpwq', x)
+        x = x.premute(0, 5, 1, 3, 2, 4)
         imgs = x.reshape(shape=(x.shape[0], c, h * p, w * p))
         return imgs
 
-    def forward(self, x, t, external_cond=None):
+    def __call__(self, x, t, external_cond=None):
         """
         Forward pass of DiT.
         x: (B, T, C, H, W) tensor of spatial inputs (images or latent representations of images)
@@ -274,12 +274,12 @@ class DiT(nn.Module):
         B, T, C, H, W = x.shape
 
         # add spatial embeddings
-        x = rearrange(x, "b t c h w -> (b t) c h w")
+        x = x.reshape(B*T, C, H, W)
         x = self.x_embedder(x) # (B*T, C, H, W) -> (B*T, H/2, W/2, D) , C = 16, D = d_model
         # restore shape
         x = rearrange(x, "(b t) h w d -> b t h w d", t = T)
         # embed noise steps
-        t = rearrange(t, "b t -> (b t)")
+        t = t.reshape(t.shape[0] * t.shape[1])
         c = self.t_embedder(t)                  # (N, D)
         c = rearrange(c, "(b t) d -> b t d", t = T)
         if torch.is_tensor(external_cond):
@@ -288,7 +288,7 @@ class DiT(nn.Module):
             x = block(x, c)                      # (N, T, H, W, D)
         x = self.final_layer(x, c)               # (N, T, H, W, patch_size ** 2 * out_channels)
         # unpatchify
-        x = rearrange(x, "b t h w d -> (b t) h w d")
+        x = x.reshape(x.shape[0] * x.shape[1], x.shape[2], x.shape[3], x.shape[4])
         x = self.unpatchify(x)                   # (N, out_channels, H, W)
         x = rearrange(x, "(b t) c h w -> b t c h w", t = T)
 

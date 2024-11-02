@@ -2,35 +2,33 @@
 References:
     - Diffusion Forcing: https://github.com/buoyancy99/diffusion-forcing
 """
-import torch
+import tinygrad
+from tinygrad import Tensor, nn, dtypes
+from tinygrad.nn.state import safe_load, load_state_dict
 from dit import DiT_models
 from vae import VAE_models
 from torchvision.io import read_video, write_video
 from utils import one_hot_actions, sigmoid_beta_schedule
 from tqdm import tqdm
 from einops import rearrange
-from torch import autocast
-assert torch.cuda.is_available()
-device = "cuda:0"
+import numpy as np
 
 # load DiT checkpoint
-ckpt = torch.load("oasis500m.pt")
+ckpt = safe_load("oasis500m.safetensors")
 model = DiT_models["DiT-S/2"]()
-model.load_state_dict(ckpt, strict=False)
-model = model.to(device).eval()
+load_state_dict(model, ckpt, strict=False)
 
 # load VAE checkpoint
-vae_ckpt = torch.load("vit-l-20.pt")
+vae_ckpt = safe_load("vit-l-20.safetensors")
 vae = VAE_models["vit-l-20-shallow-encoder"]()
-vae.load_state_dict(vae_ckpt)
-vae = vae.to(device).eval()
+load_state_dict(vae, vae_ckpt)
 
 # sampling params
 B = 1
 total_frames = 32
 max_noise_level = 1000
 ddim_noise_steps = 100
-noise_range = torch.linspace(-1, max_noise_level - 1, ddim_noise_steps + 1)
+noise_range = Tensor(np.linspace(-1, max_noise_level - 1, ddim_noise_steps + 1))
 noise_abs_max = 20
 ctx_max_noise_idx = ddim_noise_steps // 10 * 3
 
@@ -39,7 +37,7 @@ video_id = "snippy-chartreuse-mastiff-f79998db196d-20220401-224517.chunk_001"
 mp4_path = f"sample_data/{video_id}.mp4"
 actions_path = f"sample_data/{video_id}.actions.pt"
 video = read_video(mp4_path, pts_unit="sec")[0].float() / 255
-actions = one_hot_actions(torch.load(actions_path))
+actions = one_hot_actions(torch_load(actions_path))
 offset = 100
 video = video[offset:offset+total_frames].unsqueeze(0)
 actions = actions[offset:offset+total_frames].unsqueeze(0)
@@ -47,39 +45,54 @@ actions = actions[offset:offset+total_frames].unsqueeze(0)
 # sampling inputs
 n_prompt_frames = 1
 x = video[:, :n_prompt_frames]
-x = x.to(device)
-actions = actions.to(device)
 
 # vae encoding
 scaling_factor = 0.07843137255
 x = rearrange(x, "b t h w c -> (b t) c h w")
 H, W = x.shape[-2:]
-with torch.no_grad():
-    x = vae.encode(x * 2 - 1).mean * scaling_factor
+Tensor.no_grad = True
+x = vae.encode(x * 2 - 1).mean * scaling_factor
+Tensor.no_grad = False
 x = rearrange(x, "(b t) (h w) c -> b t c h w", t=n_prompt_frames, h=H//vae.patch_size, w=W//vae.patch_size)
 
 # get alphas
 betas = sigmoid_beta_schedule(max_noise_level).to(device)
 alphas = 1.0 - betas
-alphas_cumprod = torch.cumprod(alphas, dim=0)
-alphas_cumprod = rearrange(alphas_cumprod, "T -> T 1 1 1")
+
+def cumprod(x: Tensor, axis=0) -> Tensor:
+    shape = x.shape
+    if axis < 0:
+        axis += len(shape)
+    
+    # Reshape to 2D for simplicity
+    x = x.reshape(-1, shape[axis])
+    
+    result = x.copy()
+    for i in range(1, x.shape[1]):
+        result[:, i] *= result[:, i-1]
+    
+    # Reshape back to original shape
+    return result.reshape(shape)
+
+alphas_cumprod = cumprod(alphas)
+alphas_cumprod = alphas_cumprod.unsqueeze(1).unsqueeze(2).unsqueeze(3)
 
 # sampling loop
 for i in tqdm(range(n_prompt_frames, total_frames)):
-    chunk = torch.randn((B, 1, *x.shape[-3:]), device=device)
-    chunk = torch.clamp(chunk, -noise_abs_max, +noise_abs_max)
-    x = torch.cat([x, chunk], dim=1)
+    chunk = Tensor.randn((B, 1, *x.shape[-3:]))
+    chunk = chunk.clamp(-noise_abs_max, +noise_abs_max)
+    x = Tensor.cat(*[x, chunk], dim=1)
     start_frame = max(0, i + 1 - model.max_frames)
 
     for noise_idx in reversed(range(1, ddim_noise_steps + 1)):
         # set up noise values
         ctx_noise_idx = min(noise_idx, ctx_max_noise_idx)
-        t_ctx  = torch.full((B, i), noise_range[ctx_noise_idx], dtype=torch.long, device=device)
-        t      = torch.full((B, 1), noise_range[noise_idx],     dtype=torch.long, device=device)
-        t_next = torch.full((B, 1), noise_range[noise_idx - 1], dtype=torch.long, device=device)
-        t_next = torch.where(t_next < 0, t, t_next)
-        t = torch.cat([t_ctx, t], dim=1)
-        t_next = torch.cat([t_ctx, t_next], dim=1)
+        t_ctx  = Tensor.full((B, i), noise_range[ctx_noise_idx], dtype=dtypes.long)
+        t      = Tensor.full((B, 1), noise_range[noise_idx],     dtype=dtypes.long)
+        t_next = Tensor.full((B, 1), noise_range[noise_idx - 1], dtype=dtypes.long)
+        t_next = (t_next < 0).where(t, t_next)
+        t = Tensor.cat(*[t_ctx, t], dim=1)
+        t_next = Tensor.cat(*[t_ctx, t_next], dim=1)
 
         # sliding window
         x_curr = x.clone()
@@ -88,14 +101,19 @@ for i in tqdm(range(n_prompt_frames, total_frames)):
         t_next = t_next[:, start_frame:]
 
         # add some noise to the context
-        ctx_noise = torch.randn_like(x_curr[:, :-1])
-        ctx_noise = torch.clamp(ctx_noise, -noise_abs_max, +noise_abs_max)
+        ctx_noise = Tensor.randn_like(x_curr[:, :-1])
+        ctx_noise = ctx_noise.clamp(-noise_abs_max, +noise_abs_max)
         x_curr[:, :-1] = alphas_cumprod[t[:, :-1]].sqrt() * x_curr[:, :-1] + (1 - alphas_cumprod[t[:, :-1]]).sqrt() * ctx_noise
 
         # get model predictions
-        with torch.no_grad():
-            with autocast("cuda", dtype=torch.half):
-                v = model(x_curr, t, actions[:, start_frame : i + 1])
+        Tensor.no_grad = True
+        for l in get_state_dict(model).values():
+            l.replace(l.half().realize())
+        x_curr = x_curr.half().realize()
+        t = t.half().realize()
+        actions = actions.half().realize()
+        v = model(x_curr, t, actions[:, start_frame : i + 1])
+        Tensor.no_grad = False
 
         x_start = alphas_cumprod[t].sqrt() * x_curr - (1 - alphas_cumprod[t]).sqrt() * v
         x_noise = ((1 / alphas_cumprod[t]).sqrt() * x_curr - x_start) \
@@ -107,12 +125,12 @@ for i in tqdm(range(n_prompt_frames, total_frames)):
 
 # vae decoding
 x = rearrange(x, "b t c h w -> (b t) (h w) c")
-with torch.no_grad():
-    x = (vae.decode(x / scaling_factor) + 1) / 2
+Tensor.no_grad = True
+x = (vae.decode(x / scaling_factor) + 1) / 2
 x = rearrange(x, "(b t) c h w -> b t h w c", t=total_frames)
 
 # save video
-x = torch.clamp(x, 0, 1)
+x = x.clamp(0, 1)
 x = (x * 255).byte()
 write_video("video.mp4", x[0], fps=20)
 print("generation saved to video.mp4.")

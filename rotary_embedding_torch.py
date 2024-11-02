@@ -5,14 +5,15 @@ Adapted from https://github.com/lucidrains/rotary-embedding-torch/blob/main/rota
 from __future__ import annotations
 from math import pi, log
 
-import torch
-from torch.nn import Module, ModuleList
-from torch.amp import autocast
-from torch import nn, einsum, broadcast_tensors, Tensor
+import tinygrad
+from tinygrad import nn, Tensor, dtypes
+import numpy as np
 
 from einops import rearrange, repeat
 
 from typing import Literal
+
+from utils import broadcast_tensors
 
 # helper functions
 
@@ -26,17 +27,16 @@ def default(val, d):
 
 def broadcat(tensors, dim = -1):
     broadcasted_tensors = broadcast_tensors(*tensors)
-    return torch.cat(broadcasted_tensors, dim = dim)
+    return Tensor.cat(broadcasted_tensors, dim = dim)
 
 # rotary embedding helper functions
 
 def rotate_half(x):
     x = rearrange(x, '... (d r) -> ... d r', r = 2)
     x1, x2 = x.unbind(dim = -1)
-    x = torch.stack((-x2, x1), dim = -1)
+    x = Tensor.stack((-x2, x1), dim = -1)
     return rearrange(x, '... d r -> ... (d r)')
 
-@autocast('cuda', enabled = False)
 def apply_rotary_emb(freqs, t, start_index = 0, scale = 1., seq_dim = -2):
     dtype = t.dtype
 
@@ -57,15 +57,15 @@ def apply_rotary_emb(freqs, t, start_index = 0, scale = 1., seq_dim = -2):
     # Apply rotary embeddings without modifying t in place    
     t_transformed = (t_middle * freqs.cos() * scale) + (rotate_half(t_middle) * freqs.sin() * scale)
         
-    out = torch.cat((t_left, t_transformed, t_right), dim=-1)
+    out = Tensor.cat(*(t_left, t_transformed, t_right), dim=-1)
 
-    return out.type(dtype)
+    return out.cast(dtype)
 
 # learned rotation helpers
 
 def apply_learned_rotations(rotations, t, start_index = 0, freq_ranges = None):
     if exists(freq_ranges):
-        rotations = einsum('..., f -> ... f', rotations, freq_ranges)
+        rotations = Tensor.einsum('..., f -> ... f', rotations, freq_ranges)
         rotations = rearrange(rotations, '... r f -> ... (r f)')
 
     rotations = repeat(rotations, '... n -> ... (n r)', r = 2)
@@ -73,7 +73,7 @@ def apply_learned_rotations(rotations, t, start_index = 0, freq_ranges = None):
 
 # classes
 
-class RotaryEmbedding(Module):
+class RotaryEmbedding:
     def __init__(
         self,
         dim,
@@ -103,30 +103,30 @@ class RotaryEmbedding(Module):
         if exists(custom_freqs):
             freqs = custom_freqs
         elif freqs_for == 'lang':
-            freqs = 1. / (theta ** (torch.arange(0, dim, 2)[:(dim // 2)].float() / dim))
+            freqs = 1. / (theta ** (Tensor.arange(0, dim, 2)[:(dim // 2)].float() / dim))
         elif freqs_for == 'pixel':
-            freqs = torch.linspace(1., max_freq / 2, dim // 2) * pi
+            freqs = Tensor(np.linspace(1., max_freq / 2, dim // 2, dtype='f')) * pi
         elif freqs_for == 'spacetime':
-            time_freqs = 1. / (theta ** (torch.arange(0, dim, 2)[:(dim // 2)].float() / dim))
-            freqs = torch.linspace(1., max_freq / 2, dim // 2) * pi
+            time_freqs = 1. / (theta ** (Tensor.arange(0, dim, 2)[:(dim // 2)].float() / dim))
+            freqs = Tensor(np.linspace(1., max_freq / 2, dim // 2, dtype='f')) * pi
         elif freqs_for == 'constant':
-            freqs = torch.ones(num_freqs).float()
+            freqs = Tensor.ones(num_freqs).float()
 
         if freqs_for == 'spacetime':
-            self.time_freqs = nn.Parameter(time_freqs, requires_grad = learned_freq)
-        self.freqs = nn.Parameter(freqs, requires_grad = learned_freq)
+            self.time_freqs = Tensor(time_freqs.numpy(), requires_grad = learned_freq, dtype=dtypes.float32)
+        self.freqs = Tensor(freqs.numpy(), requires_grad = learned_freq, dtype=dtypes.float32)
 
         self.cache_if_possible = cache_if_possible
         self.cache_max_seq_len = cache_max_seq_len
 
-        self.register_buffer('cached_freqs', torch.zeros(cache_max_seq_len, dim), persistent = False)
-        self.register_buffer('cached_freqs_seq_len', torch.tensor(0), persistent = False)
+        self.cached_freqs = Tensor.zeros(cache_max_seq_len, dim, requires_grad = False)
+        self.cached_freqs_seq_len = Tensor(0, requires_grad = False)
 
         self.learned_freq = learned_freq
 
         # dummy for device
 
-        self.register_buffer('dummy', torch.tensor(0), persistent = False)
+        self.dummy = Tensor(0, requires_grad = False)
 
         # default sequence dimension
 
@@ -145,12 +145,12 @@ class RotaryEmbedding(Module):
         if not use_xpos:
             return
 
-        scale = (torch.arange(0, dim, 2) + 0.4 * dim) / (1.4 * dim)
+        scale = (Tensor.arange(0, dim, 2) + 0.4 * dim) / (1.4 * dim)
         self.scale_base = xpos_scale_base
 
-        self.register_buffer('scale', scale, persistent = False)
-        self.register_buffer('cached_scales', torch.zeros(cache_max_seq_len, dim), persistent = False)
-        self.register_buffer('cached_scales_seq_len', torch.tensor(0), persistent = False)
+        self.scale = Tensor(scale, requires_grad = False)
+        self.cached_scales = Tensor.zeros(cache_max_seq_len, dim, requires_grad = False)
+        self.cached_scales_seq_len = Tensor(0, requires_grad = False)
 
         # add apply_rotary_emb as static method
 
@@ -161,7 +161,7 @@ class RotaryEmbedding(Module):
         return self.dummy.device
 
     def get_seq_pos(self, seq_len, device, dtype, offset = 0):
-        return (torch.arange(seq_len, device = device, dtype = dtype) + offset) / self.interpolate_factor
+        return (Tensor.arange(seq_len, dtype = dtype) + offset) / self.interpolate_factor
 
     def rotate_queries_or_keys(self, t, freqs, seq_dim = None, offset = 0, scale = None):
         seq_dim = default(seq_dim, self.default_seq_dim)
@@ -172,10 +172,10 @@ class RotaryEmbedding(Module):
 
         seq = self.get_seq_pos(seq_len, device = device, dtype = dtype, offset = offset)
 
-        seq_freqs = self.forward(seq, freqs, seq_len = seq_len, offset = offset)
+        seq_freqs = self(seq, freqs, seq_len = seq_len, offset = offset)
 
         if seq_dim == -3:
-            seq_freqs = rearrange(seq_freqs, 'n d -> n 1 d')
+            seq_freqs = seq_freqs.unsqueeze(1)
 
         return apply_rotary_emb(seq_freqs, t, scale = default(scale, 1.), seq_dim = seq_dim)
 
@@ -209,7 +209,7 @@ class RotaryEmbedding(Module):
 
         seq = self.get_seq_pos(seq_len, dtype = dtype, device = device)
 
-        seq_freqs = self.forward(seq, freqs, seq_len = seq_len)
+        seq_freqs = self(seq, freqs, seq_len = seq_len)
         scale = self.get_scale(seq, seq_len = seq_len).to(dtype)
 
         if seq_dim == -3:
@@ -265,14 +265,14 @@ class RotaryEmbedding(Module):
             # only allow pixel freqs for last two dimensions
             use_pixel = (self.freqs_for == 'pixel' or self.freqs_for == 'spacetime') and ind >= len(dims) - 2
             if use_pixel:
-                pos = torch.linspace(-1, 1, steps = dim, device = self.device)
+                pos = Tensor(np.linspace(-1, 1, dim, dtype='f'))
             else:
-                pos = torch.arange(dim, device = self.device)
+                pos = Tensor.arange(dim)
 
             if self.freqs_for == 'spacetime' and not use_pixel:
-                seq_freqs = self.forward(pos, self.time_freqs, seq_len = dim)
+                seq_freqs = self(pos, self.time_freqs, seq_len = dim)
             else:
-                seq_freqs = self.forward(pos, self.freqs, seq_len = dim)
+                seq_freqs = self(pos, self.freqs, seq_len = dim)
 
             all_axis = [None] * len(dims)
             all_axis[ind] = Colon
@@ -281,10 +281,9 @@ class RotaryEmbedding(Module):
             all_freqs.append(seq_freqs[new_axis_slice])
 
         all_freqs = broadcast_tensors(*all_freqs)
-        return torch.cat(all_freqs, dim = -1)
+        return Tensor.cat(*all_freqs, dim = -1)
 
-    @autocast('cuda', enabled = False)
-    def forward(
+    def __call__(
         self,
         t: Tensor,
         freqs: Tensor,
@@ -306,7 +305,8 @@ class RotaryEmbedding(Module):
         ):
             return self.cached_freqs[offset:(offset + seq_len)].detach()
 
-        freqs = einsum('..., f -> ... f', t.type(freqs.dtype), freqs)
+        print(f'freqs: {freqs.numpy()}, t casted: {t.cast(freqs.dtype).numpy()}')
+        freqs = t.cast(freqs.dtype).reshape(*t.shape, 1) * freqs
         freqs = repeat(freqs, '... n -> ... (n r)', r = 2)
 
         if should_cache and offset == 0:

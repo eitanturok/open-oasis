@@ -2,16 +2,11 @@
 Adapted from https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/embeddings.py
 """
 
-from typing import Optional
+from typing import Optional, Callable
 import math
-import torch
-from torch import nn
+from tinygrad import Tensor, nn
 
-# pylint: disable=unused-import
-from diffusers.models.embeddings import TimestepEmbedding
-
-
-class Timesteps(nn.Module):
+class Timesteps:
     def __init__(
         self,
         num_channels: int,
@@ -23,7 +18,7 @@ class Timesteps(nn.Module):
         self.flip_sin_to_cos = flip_sin_to_cos
         self.downscale_freq_shift = downscale_freq_shift
 
-    def forward(self, timesteps):
+    def __call__(self, timesteps):
         t_emb = get_timestep_embedding(
             timesteps,
             self.num_channels,
@@ -32,7 +27,7 @@ class Timesteps(nn.Module):
         )
         return t_emb
 
-class Positions2d(nn.Module):
+class Positions2d:
     def __init__(
         self,
         num_channels: int,
@@ -44,7 +39,7 @@ class Positions2d(nn.Module):
         self.flip_sin_to_cos = flip_sin_to_cos
         self.downscale_freq_shift = downscale_freq_shift
 
-    def forward(self, grid):
+    def __call__(self, grid):
         h_emb = get_timestep_embedding(
             grid[0],
             self.num_channels // 2,
@@ -60,9 +55,47 @@ class Positions2d(nn.Module):
         emb = torch.cat((h_emb, w_emb), dim=-1)
         return emb
 
+class TimestepEmbedding:
+    def __init__(
+        self,
+        in_channels: int,
+        time_embed_dim: int,
+        act_fn: Callable = Tensor.silu,
+        out_dim: int = None,
+        post_act_fn: Optional[Callable] = None,
+        cond_proj_dim=None,
+        sample_proj_bias=True,
+    ):
+        self.linear_1 = nn.Linear(in_channels, time_embed_dim, sample_proj_bias)
+        if cond_proj_dim is not None:
+            self.cond_proj = nn.Linear(cond_proj_dim, in_channels, bias=False)
+        else:
+            self.cond_proj = None
+        self.act = act_fn
+        if out_dim is not None:
+            time_embed_dim_out = out_dim
+        else:
+            time_embed_dim_out = time_embed_dim
+        self.linear_2 = nn.Linear(time_embed_dim, time_embed_dim_out, sample_proj_bias)
+        if post_act_fn is None:
+            self.post_act = None
+        else:
+            self.post_act = post_act_fn
+
+    def __call__(self, sample, condition=None):
+        if condition is not None:
+            sample = sample + self.cond_proj(condition)
+        sample = self.linear_1(sample)
+        if self.act is not None:
+            sample = self.act(sample)
+        sample = self.linear_2(sample)
+        if self.post_act is not None:
+            sample = self.post_act(sample)
+        return sample
+
 
 def get_timestep_embedding(
-    timesteps: torch.Tensor,
+    timesteps: Tensor,
     embedding_dim: int,
     flip_sin_to_cos: bool = False,
     downscale_freq_shift: float = 1,
@@ -84,20 +117,20 @@ def get_timestep_embedding(
     exponent = -math.log(max_period) * torch.arange(start=0, end=half_dim, dtype=torch.float32, device=timesteps.device)
     exponent = exponent / (half_dim - downscale_freq_shift)
 
-    emb = torch.exp(exponent)
+    emb = exponent.exp()
     emb = timesteps[..., None].float() * emb
 
     # scale embeddings
     emb = scale * emb
 
     # concat sine and cosine embeddings
-    emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=-1)
+    emb = Tensor.cat(*[emb.sin(), emb.cos()], dim=-1)
 
     # flip sine and cosine embeddings
     if flip_sin_to_cos:
-        emb = torch.cat([emb[..., half_dim:], emb[..., :half_dim]], dim=-1)
+        emb = Tensor.cat(*[emb[..., half_dim:], emb[..., :half_dim]], dim=-1)
 
     # zero pad
     if embedding_dim % 2 == 1:
-        emb = torch.nn.functional.pad(emb, (0, 1, 0, 0))
+        emb = emb.pad((0, 1, 0, 0))
     return emb
