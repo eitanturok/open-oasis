@@ -129,8 +129,10 @@ class RotaryEmbedding:
             freqs = Tensor.ones(num_freqs).float()
 
         if freqs_for == 'spacetime':
-            self.time_freqs = Tensor(time_freqs.numpy(), requires_grad = learned_freq, dtype=dtypes.float32)
-        self.freqs = Tensor(freqs.numpy(), requires_grad = learned_freq, dtype=dtypes.float32)
+            self.time_freqs = Tensor.zeros(time_freqs.shape, requires_grad = learned_freq, dtype=dtypes.float32)
+            self.time_freqs = self.time_freqs.replace(time_freqs)
+        self.freqs = Tensor.zeros(freqs.shape, requires_grad = learned_freq, dtype=dtypes.float32)
+        self.freqs = self.freqs.replace(freqs)
 
         self.cache_if_possible = cache_if_possible
         self.cache_max_seq_len = cache_max_seq_len

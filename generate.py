@@ -26,7 +26,7 @@ load_state_dict(vae, vae_ckpt, strict=False)
 
 # sampling params
 B = 1
-total_frames = 32
+total_frames = 3
 max_noise_level = 1000
 ddim_noise_steps = 100
 noise_range = Tensor(np.linspace(-1, max_noise_level - 1, ddim_noise_steps + 1))
