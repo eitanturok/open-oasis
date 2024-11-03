@@ -79,8 +79,7 @@ def cumprod(x: Tensor, axis=0) -> Tensor:
 alphas_cumprod = cumprod(alphas)
 alphas_cumprod = alphas_cumprod.unsqueeze(1).unsqueeze(2).unsqueeze(3).realize()
 
-#@TinyJit
-def jit(x_curr:Tensor, t:Tensor, t_next:Tensor, actions_chunk: Tensor) -> Tensor:
+def model_pred(x_curr:Tensor, t:Tensor, t_next:Tensor, actions_chunk: Tensor) -> Tensor:
     v = model(x_curr, t, actions_chunk).realize()
     x_start = alphas_cumprod[t].sqrt() * x_curr - (1 - alphas_cumprod[t]).sqrt() * v
     x_noise = ((1 / alphas_cumprod[t]).sqrt() * x_curr - x_start) \
@@ -98,6 +97,8 @@ for i in tqdm(range(n_prompt_frames, total_frames)):
     x = Tensor.cat(x, chunk, dim=1)
     start_frame = max(0, i + 1 - model.max_frames)
     print(f'step: {i}')
+
+    jit_model_pred = TinyJit(model_pred)
 
     for noise_idx in reversed(range(1, ddim_noise_steps + 1)):
         # set up noise values
@@ -124,8 +125,10 @@ for i in tqdm(range(n_prompt_frames, total_frames)):
         Tensor.no_grad = True
         print(f'x_curr: {x_curr}, t: {t}, actions_chunk: {actions[:, start_frame : i + 1]}')
         #v = model(x_curr, t, actions[:, start_frame : i + 1])
-        x_pred = jit(x_curr, t, t_next, actions[:, start_frame : i + 1]).contiguous().realize()
+        x_pred = jit_model_pred(x_curr, t, t_next, actions[:, start_frame : i + 1]).contiguous().realize()
         x[:, -1:] = x_pred[:, -1:].contiguous().realize()
+
+    jit_model_pred.reset()
 
 # vae decoding
 x = rearrange(x, "b t c h w -> (b t) (h w) c")
