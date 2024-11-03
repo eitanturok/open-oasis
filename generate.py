@@ -79,7 +79,7 @@ def cumprod(x: Tensor, axis=0) -> Tensor:
 alphas_cumprod = cumprod(alphas)
 alphas_cumprod = alphas_cumprod.unsqueeze(1).unsqueeze(2).unsqueeze(3).realize()
 
-@TinyJit
+#@TinyJit
 def jit(x_curr:Tensor, t:Tensor, t_next:Tensor, actions_chunk: Tensor) -> Tensor:
     v = model(x_curr, t, actions_chunk).realize()
     x_start = alphas_cumprod[t].sqrt() * x_curr - (1 - alphas_cumprod[t]).sqrt() * v
@@ -135,8 +135,8 @@ x = rearrange(x, "(b t) c h w -> b t h w c", t=total_frames)
 
 # save video
 x = x.clamp(0, 1)
-x = (x * 255).byte()
-imageio.mimsave("./video.mp4", numpy.stack(x[0].numpy()), fps=20)
+x = (x * 255).cast(dtype=dtypes.uchar)
+imageio.mimsave("./video.mp4", np.stack(x[0].numpy()), fps=20)
 
 print("generation saved to video.mp4.")
 
