@@ -4,7 +4,7 @@ References:
 """
 import tinygrad
 from tinygrad import Tensor, nn, dtypes, TinyJit
-from tinygrad.nn.state import safe_load, load_state_dict, torch_load, get_state_dict
+from tinygrad.nn.state import safe_load, load_state_dict, get_state_dict, torch_load
 from dit import DiT_models
 from vae import VAE_models
 from torchvision.io import read_video, write_video
@@ -14,15 +14,15 @@ from einops import rearrange
 import numpy as np
 import imageio
 
-# load DiT checkpoint
-ckpt = safe_load("oasis500m.safetensors")
-model = DiT_models["DiT-S/2"]()
-load_state_dict(model, ckpt, strict=False)
-
 # load VAE checkpoint
 vae_ckpt = safe_load("vit-l-20.safetensors")
 vae = VAE_models["vit-l-20-shallow-encoder"]()
 load_state_dict(vae, vae_ckpt, strict=False)
+
+# load DiT checkpoint
+ckpt = safe_load("oasis500m.safetensors")
+model = DiT_models["DiT-S/2"]()
+load_state_dict(model, ckpt, strict=False)
 
 # sampling params
 B = 1
@@ -33,7 +33,7 @@ noise_range = Tensor(np.linspace(-1, max_noise_level - 1, ddim_noise_steps + 1))
 noise_abs_max = 20
 ctx_max_noise_idx = ddim_noise_steps // 10 * 3
 
-# get input video 
+# get input video
 video_id = "snippy-chartreuse-mastiff-f79998db196d-20220401-224517.chunk_001"
 mp4_path = f"sample_data/{video_id}.mp4"
 actions_path = f"sample_data/{video_id}.actions.pt"
@@ -64,15 +64,15 @@ def cumprod(x: Tensor, axis=0) -> Tensor:
     shape = x.shape
     if axis < 0:
         axis += len(shape)
-    
+
     # Reshape to 2D for simplicity
     x = x.reshape(-1, shape[axis])
-    
+
     # Hack to get .copy() implemented
     result = Tensor(x.numpy(), dtype=x.dtype).contiguous()
     for i in range(1, x.shape[1]):
         result[:, i] = (result[:, i] * result[:, i-1]).realize()
-    
+
     # Reshape back to original shape
     return result.reshape(shape)
 
