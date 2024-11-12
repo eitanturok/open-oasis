@@ -10,7 +10,7 @@ from collections import namedtuple
 import tinygrad
 from tinygrad import Tensor, nn, dtypes
 from einops import rearrange
-from rotary_embedding_torch import RotaryEmbedding, apply_rotary_emb
+from rotary_embedding_tinygrad import RotaryEmbedding, apply_rotary_emb
 from dit import PatchEmbed
 from timm_helpers import Mlp
 from utils import xavier_uniform_, Module
