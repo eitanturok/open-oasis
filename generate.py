@@ -29,7 +29,7 @@ B = 1
 total_frames = 32
 max_noise_level = 1000
 ddim_noise_steps = 100
-noise_range = Tensor(np.linspace(-1, max_noise_level - 1, ddim_noise_steps + 1))
+noise_range = np.linspace(-1, max_noise_level - 1, ddim_noise_steps + 1, dtype='f')
 noise_abs_max = 20
 ctx_max_noise_idx = ddim_noise_steps // 10 * 3
 
@@ -103,15 +103,15 @@ for i in tqdm(range(n_prompt_frames, total_frames)):
     for noise_idx in reversed(range(1, ddim_noise_steps + 1)):
         # set up noise values
         ctx_noise_idx = min(noise_idx, ctx_max_noise_idx)
-        t_ctx  = Tensor.full((B, i), noise_range[ctx_noise_idx].item(), dtype=dtypes.long)
-        t      = Tensor.full((B, 1), noise_range[noise_idx].item(),     dtype=dtypes.long)
-        t_next = Tensor.full((B, 1), noise_range[noise_idx - 1].item(), dtype=dtypes.long)
+        t_ctx  = Tensor.full((B, i), float(noise_range[ctx_noise_idx]), dtype=dtypes.long)
+        t      = Tensor.full((B, 1), float(noise_range[noise_idx]),     dtype=dtypes.long)
+        t_next = Tensor.full((B, 1), float(noise_range[noise_idx - 1]), dtype=dtypes.long)
         t_next = (t_next < 0).where(t, t_next)
         t = Tensor.cat(t_ctx, t, dim=1).realize()
         t_next = Tensor.cat(t_ctx, t_next, dim=1).realize()
 
         # sliding window
-        x_curr = Tensor(x.numpy(), requires_grad=x.requires_grad)
+        x_curr = x.detach()
         x_curr = x_curr[:, start_frame:].detach().realize()
         t = t[:, start_frame:].detach()
         t_next = t_next[:, start_frame:].detach()
@@ -124,7 +124,6 @@ for i in tqdm(range(n_prompt_frames, total_frames)):
         # get model predictions
         Tensor.no_grad = True
         print(f'x_curr: {x_curr}, t: {t}, actions_chunk: {actions[:, start_frame : i + 1]}')
-        #v = model(x_curr, t, actions[:, start_frame : i + 1])
         x_pred = jit_model_pred(x_curr, t, t_next, actions[:, start_frame : i + 1]).contiguous().realize()
         x[:, -1:] = x_pred[:, -1:].contiguous().realize()
 
