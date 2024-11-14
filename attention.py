@@ -5,7 +5,7 @@ from typing import Optional
 from collections import namedtuple
 from tinygrad import Tensor, nn
 from einops import rearrange
-from rotary_embedding_torch import RotaryEmbedding, apply_rotary_emb
+from rotary_embedding_tinygrad import RotaryEmbedding, apply_rotary_emb
 from embeddings import TimestepEmbedding, Timesteps, Positions2d
 
 class TemporalAxialAttention:

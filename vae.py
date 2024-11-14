@@ -10,7 +10,7 @@ from collections import namedtuple
 import tinygrad
 from tinygrad import Tensor, nn, dtypes
 from einops import rearrange
-from rotary_embedding_torch import RotaryEmbedding, apply_rotary_emb
+from rotary_embedding_tinygrad import RotaryEmbedding, apply_rotary_emb
 from dit import PatchEmbed
 from timm_helpers import Mlp
 from utils import xavier_uniform_, Module
@@ -67,7 +67,8 @@ class Attention:
             freqs_for="pixel", 
             max_freq=frame_height*frame_width,
         ).get_axial_freqs(frame_height, frame_width)
-        self.rotary_freqs = Tensor(rotary_freqs.numpy(), requires_grad=False)
+        self.rotary_freqs = Tensor.zeros(rotary_freqs.shape, requires_grad=False)
+        self.rotary_freqs = self.rotary_freqs.replace(rotary_freqs)
 
     def __call__(self, x:Tensor) -> Tensor:
         B, N, C = x.shape

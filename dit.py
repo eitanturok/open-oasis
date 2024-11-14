@@ -7,7 +7,7 @@ References:
 from typing import Optional, Literal
 import tinygrad
 from tinygrad import nn, Tensor, dtypes
-from rotary_embedding_torch import RotaryEmbedding
+from rotary_embedding_tinygrad import RotaryEmbedding
 from einops import rearrange
 from embeddings import Timesteps, TimestepEmbedding
 from attention import SpatialAxialAttention, TemporalAxialAttention
